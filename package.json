@@ -1,0 +1,17 @@
+{
+  "name": "cardscan-server",
+  "version": "1.0.0",
+  "description": "CardScan backend: Groq card scanning, Supabase profiles, leaderboard and follows",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}
