@@ -7,6 +7,9 @@
  *   SUPABASE_SERVICE_KEY  required (service_role key, keep it secret)
  *   GROQ_MODEL            optional, default meta-llama/llama-4-scout-17b-16e-instruct
  *   POKEMONTCG_API_KEY    optional, raises the price API rate limit
+ *   PAYPAL_SECRET         required (secret key, never put in the frontend)
+ *   PAYPAL_MODE           optional, 'live' (default) or 'sandbox'
+ *   FREE_ACCESS_EMAILS    optional, comma-separated emails that skip payment and get the tick
  *   FRONTEND_ORIGIN       optional, e.g. https://yourname.github.io (default: allow all)
  *
  * SUPABASE SETUP (run once in the SQL editor):
@@ -51,11 +54,15 @@ const { createClient } = require('@supabase/supabase-js');
 
 const {
   GROQ_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY, POKEMONTCG_API_KEY, FRONTEND_ORIGIN,
+  PAYPAL_CLIENT_ID = 'BAA8bGxWP8Qy_Un_xkAGO7LDioFhOoTSq6yH36DUff3ELNK8-M_Y-KFk7SWBsWZean7p4K4NbZgcSzMRrc', PAYPAL_SECRET, PAYPAL_MODE = 'live', FREE_ACCESS_EMAILS = '',
   GROQ_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct',
   PORT = 3000,
 } = process.env;
 
 const BADGE_THRESHOLD = 1000;
+const PLAN_BASE = 'P-5D518934NU797154NNLSNGNQ';      // $5.99/month
+const PLAN_VERIFIED = 'P-0JC88557EV905654NNLSNH4Y';  // $9.99/month (includes the verified tick)
+const FREE_SET = new Set(FREE_ACCESS_EMAILS.split(',').map(e => e.trim().toLowerCase()).filter(Boolean));
 if (!GROQ_API_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error('Missing GROQ_API_KEY, SUPABASE_URL or SUPABASE_SERVICE_KEY');
   process.exit(1);
@@ -67,7 +74,7 @@ app.use(cors(FRONTEND_ORIGIN ? { origin: FRONTEND_ORIGIN } : {}));
 app.use(express.json({ limit: '8mb' }));
 
 /* ---------- helpers ---------- */
-const wrap = fn => (req, res) => fn(req, res).catch(e => {
+const wrap = fn => (req, res, next) => fn(req, res, next).catch(e => {
   console.error(e);
   res.status(e.status || 500).json({ error: e.status ? e.message : 'Something went wrong' });
 });
@@ -88,12 +95,14 @@ setInterval(() => hits.clear(), 10 * 60 * 1000).unref();
 
 // Auth: reads a Supabase access token from "Authorization: Bearer <token>"
 async function getUser(req) {
+  if (req._u) return req._u;
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
   if (!token) return null;
   const { data, error } = await db.auth.getUser(token);
   if (error || !data?.user) return null;
   await ensureProfile(data.user);
+  req._u = data.user;
   return data.user;
 }
 const optionalAuth = wrap(async (req, _res, next) => { req.user = await getUser(req); next(); });
@@ -104,17 +113,64 @@ const requireAuth = wrap(async (req, _res, next) => {
 });
 
 async function ensureProfile(user) {
-  const { data } = await db.from('profiles').select('id').eq('id', user.id).maybeSingle();
-  if (data) return;
+  const free = FREE_SET.has((user.email || '').toLowerCase());
+  const { data } = await db.from('profiles').select('id,free_access').eq('id', user.id).maybeSingle();
+  if (data) {
+    if (free && !data.free_access) await db.from('profiles').update({ free_access: true, verified: true }).eq('id', user.id);
+    return;
+  }
   let base = (user.user_metadata?.username || (user.email || 'collector').split('@')[0])
-    .toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 14) || 'collector';
+    .toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 16) || 'collector';
   if (base.length < 3) base += 'user';
   for (let i = 0; i < 5; i++) {
     const username = i === 0 ? base : base + Math.floor(Math.random() * 9999);
-    const { error } = await db.from('profiles').insert({ id: user.id, username });
+    const { error } = await db.from('profiles').insert({ id: user.id, username, free_access: free, verified: free });
     if (!error) return;
   }
 }
+
+/* ---------- PayPal subscriptions (no webhooks: we ask PayPal directly) ---------- */
+const PP = PAYPAL_MODE === 'sandbox' ? 'https://api-m.sandbox.paypal.com' : 'https://api-m.paypal.com';
+async function ppSub(id) {
+  if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) throw fail(500, 'Payments are not configured.');
+  const t = await fetch(PP + '/v1/oauth2/token', {
+    method: 'POST',
+    headers: { Authorization: 'Basic ' + Buffer.from(PAYPAL_CLIENT_ID + ':' + PAYPAL_SECRET).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=client_credentials',
+  });
+  if (!t.ok) throw fail(502, 'Could not reach PayPal.');
+  const { access_token } = await t.json();
+  const r = await fetch(PP + '/v1/billing/subscriptions/' + encodeURIComponent(id), { headers: { Authorization: 'Bearer ' + access_token } });
+  if (!r.ok) throw fail(404, 'Subscription not found.');
+  return r.json();
+}
+async function saveSub(userId, freeAccess, sub) {
+  const active = sub.status === 'ACTIVE';
+  const plan = sub.plan_id === PLAN_VERIFIED ? 'verified' : sub.plan_id === PLAN_BASE ? 'base' : null;
+  await db.from('profiles').update({
+    subscription_id: sub.id, plan, sub_status: sub.status, sub_checked_at: new Date().toISOString(),
+    verified: !!freeAccess || (active && plan === 'verified'),
+  }).eq('id', userId);
+}
+async function accessFor(userId, p) {
+  if (p?.free_access) return true;
+  if (!p?.subscription_id) return false;
+  const stale = !p.sub_checked_at || Date.now() - new Date(p.sub_checked_at).getTime() > 6 * 3600 * 1000;
+  if (stale) {
+    try { const sub = await ppSub(p.subscription_id); await saveSub(userId, false, sub); return sub.status === 'ACTIVE'; }
+    catch (e) { /* PayPal unreachable: keep last known status */ }
+  }
+  return p.sub_status === 'ACTIVE';
+}
+// Everyone needs an active subscription (or a free-access email) to use the app
+const paid = wrap(async (req, _res, next) => {
+  const u = await getUser(req);
+  if (!u) throw fail(401, 'Please sign in.');
+  req.user = u;
+  const { data: p } = await db.from('profiles').select('free_access,subscription_id,sub_status,sub_checked_at').eq('id', u.id).single();
+  if (!(await accessFor(u.id, p))) throw fail(402, 'subscription_required');
+  next();
+});
 
 async function recalc(userId) {
   const { data } = await db.from('cards').select('price').eq('user_id', userId);
@@ -213,6 +269,50 @@ async function groqIdentify(image) {
 app.get('/', (_req, res) => res.json({ ok: true }));
 app.get('/health', (_req, res) => res.json({ ok: true, badge_threshold: BADGE_THRESHOLD }));
 
+/* auth */
+async function sessionFor(email, password) {
+  const c = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
+  const { data, error } = await c.auth.signInWithPassword({ email, password });
+  if (error || !data?.session) throw fail(401, 'Wrong email or password.');
+  return { token: data.session.access_token, refresh_token: data.session.refresh_token };
+}
+app.post('/auth/signup', wrap(async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase(), password = String(req.body?.password || ''), username = String(req.body?.username || '').trim();
+  if (!/^\S+@\S+\.\S+$/.test(email)) throw fail(400, 'Enter a valid email.');
+  if (password.length < 6) throw fail(400, 'Password must be at least 6 characters.');
+  if (!USERNAME_RE.test(username)) throw fail(400, 'Username must be 3-20 letters, numbers or underscores.');
+  const { data: taken } = await db.from('profiles').select('id').ilike('username', username).maybeSingle();
+  if (taken) throw fail(409, 'That username is taken.');
+  const { error } = await db.auth.admin.createUser({ email, password, email_confirm: true, user_metadata: { username: username.toLowerCase() } });
+  if (error) throw fail(400, /registered|exists/i.test(error.message) ? 'That email already has an account.' : 'Could not create account.');
+  res.json(await sessionFor(email, password));
+}));
+app.post('/auth/login', wrap(async (req, res) => {
+  res.json(await sessionFor(String(req.body?.email || '').trim().toLowerCase(), String(req.body?.password || '')));
+}));
+app.post('/auth/refresh', wrap(async (req, res) => {
+  const c = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
+  const { data, error } = await c.auth.refreshSession({ refresh_token: String(req.body?.refresh_token || '') });
+  if (error || !data?.session) throw fail(401, 'Session expired.');
+  res.json({ token: data.session.access_token, refresh_token: data.session.refresh_token });
+}));
+
+/* subscription: the app sends the PayPal subscription ID, we confirm it with PayPal */
+app.post('/subscription/activate', requireAuth, wrap(async (req, res) => {
+  const id = String(req.body?.subscriptionID || '').trim();
+  if (!id) throw fail(400, 'Missing subscription.');
+  const sub = await ppSub(id);
+  if (sub.plan_id !== PLAN_BASE && sub.plan_id !== PLAN_VERIFIED) throw fail(400, 'Unknown plan.');
+  if (sub.status !== 'ACTIVE') throw fail(402, 'PayPal has not activated this subscription yet.');
+  const { data: other } = await db.from('profiles').select('id').eq('subscription_id', id).neq('id', req.user.id).maybeSingle();
+  if (other) throw fail(409, 'This subscription is already linked to another account.');
+  const { data: p } = await db.from('profiles').select('free_access').eq('id', req.user.id).single();
+  await saveSub(req.user.id, p?.free_access, sub);
+  res.json({ ok: true, plan: sub.plan_id === PLAN_VERIFIED ? 'verified' : 'base' });
+}));
+
+app.use(['/scan', '/search', '/collection', '/leaderboard', '/profile', '/discover', '/follow', '/me/avatar'], paid);
+
 // Scan: Groq identifies, real price data supplies the value
 app.post('/scan', limit(10, 60 * 1000), wrap(async (req, res) => {
   const image = req.body?.image;
@@ -236,7 +336,7 @@ app.get('/search', wrap(async (req, res) => {
 app.get('/collection', requireAuth, wrap(async (req, res) => {
   const { data, error } = await db.from('cards').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
   if (error) throw error;
-  const { data: p } = await db.from('profiles').select('total_value,card_count,badge').eq('id', req.user.id).single();
+  const { data: p } = await db.from('profiles').select('total_value,card_count,badge,verified').eq('id', req.user.id).single();
   res.json({ cards: data, total_value: p?.total_value || 0, card_count: p?.card_count || 0, badge: !!p?.badge, badge_threshold: BADGE_THRESHOLD });
 }));
 
@@ -275,18 +375,22 @@ app.post('/collection/refresh', requireAuth, wrap(async (req, res) => {
 app.get('/leaderboard', optionalAuth, wrap(async (req, res) => {
   const lim = Math.min(Number(req.query.limit) || 50, 100);
   const { data, error } = await db.from('profiles')
-    .select('id,username,avatar_url,total_value,card_count,badge')
+    .select('id,username,avatar_url,total_value,card_count,badge,verified')
     .gt('card_count', 0).order('total_value', { ascending: false }).limit(lim);
   if (error) throw error;
   const rows = (await decorate(data, req.user?.id)).map((r, i) => ({ ...r, rank: i + 1 }));
   res.json({ leaderboard: rows });
 }));
 
+
 /* me */
 app.get('/me', requireAuth, wrap(async (req, res) => {
   const { data: p, error } = await db.from('profiles').select('*').eq('id', req.user.id).single();
   if (error) throw error;
-  res.json({ ...p, email: req.user.email, ...(await counts(req.user.id)), badge_threshold: BADGE_THRESHOLD });
+  const subscribed = await accessFor(req.user.id, p);
+  const { data: fresh } = await db.from('profiles').select('*').eq('id', req.user.id).single();
+  const { subscription_id, ...safe } = fresh || p;
+  res.json({ ...safe, subscribed, email: req.user.email, ...(await counts(req.user.id)), badge_threshold: BADGE_THRESHOLD });
 }));
 
 app.patch('/me', requireAuth, wrap(async (req, res) => {
@@ -318,7 +422,7 @@ app.post('/me/avatar', requireAuth, wrap(async (req, res) => {
 
 /* profiles, follows, discover */
 async function profileByName(name) {
-  const { data } = await db.from('profiles').select('id,username,avatar_url,bio,total_value,card_count,badge,created_at').ilike('username', name).maybeSingle();
+  const { data } = await db.from('profiles').select('id,username,avatar_url,bio,total_value,card_count,badge,verified,created_at').ilike('username', name).maybeSingle();
   if (!data) throw fail(404, 'Profile not found.');
   return data;
 }
@@ -337,7 +441,7 @@ async function listFollows(req, res, mode) {
   const { data } = await db.from('follows').select(other).eq(mine, p.id).order('created_at', { ascending: false }).limit(100);
   const ids = (data || []).map(r => r[other]);
   if (!ids.length) return res.json({ users: [] });
-  const { data: users } = await db.from('profiles').select('id,username,avatar_url,total_value,badge').in('id', ids);
+  const { data: users } = await db.from('profiles').select('id,username,avatar_url,total_value,badge,verified').in('id', ids);
   res.json({ users: await decorate(users || [], req.user?.id) });
 }
 app.get('/profile/:username/followers', optionalAuth, wrap((req, res) => listFollows(req, res, 'followers')));
@@ -357,7 +461,7 @@ app.delete('/follow/:userId', requireAuth, wrap(async (req, res) => {
 // Discover people: search by username, or suggestions you don't follow yet
 app.get('/discover', optionalAuth, wrap(async (req, res) => {
   const q = String(req.query.q || '').trim().replace(/[%_,()]/g, '');
-  let query = db.from('profiles').select('id,username,avatar_url,bio,total_value,card_count,badge').limit(30);
+  let query = db.from('profiles').select('id,username,avatar_url,bio,total_value,card_count,badge,verified').limit(30);
   if (q) query = query.ilike('username', `%${q}%`);
   else query = query.order('total_value', { ascending: false });
   if (req.user) query = query.neq('id', req.user.id);
